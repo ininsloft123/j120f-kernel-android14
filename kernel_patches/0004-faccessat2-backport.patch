@@ -1,0 +1,55 @@
+From: J1 Android 14 Port <j1-port@local>
+Date: Mon, 01 Sep 2026 00:00:03 +0000
+Subject: [PATCH 4/7] faccessat2: add faccessat2() syscall stub
+
+Android 14's bionic libc uses faccessat2() for file permission
+checks with AT_EMPTY_PATH / AT_SYMLINK_NOFOLLOW flags.
+Backport the stub that delegates to faccessat() for standard calls.
+
+diff --git a/fs/open.c b/fs/open.c
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -440,3 +440,35 @@ SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+     return do_faccessat(dfd, filename, mode);
+ }
++
++SYSCALL_DEFINE4(faccessat2, int, dfd, const char __user *, filename,
++        int, mode, int, flags)
++{
++    if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH))
++        return -EINVAL;
++    if (mode & ~S_IRWXO)
++        return -EINVAL;
++
++    if ((flags & AT_EMPTY_PATH)) {
++        struct path path;
++        int error;
++        error = user_path_at(dfd, filename,
++                             (flags & AT_SYMLINK_NOFOLLOW) ? 0 : LOOKUP_FOLLOW,
++                             &path);
++        if (error)
++            return error;
++        error = inode_permission(path.dentry->d_inode, mode);
++        path_put(&path);
++        return error;
++    }
++
++    return do_faccessat(dfd, filename, mode);
++}
+
+diff --git a/arch/arm/include/uapi/asm/unistd.h b/arch/arm/include/uapi/asm/unistd.h
+--- a/arch/arm/include/uapi/asm/unistd.h
++++ b/arch/arm/include/uapi/asm/unistd.h
+@@ -411,6 +411,7 @@
+ #define __NR_bpf            (__NR_SYSCALL_BASE+386)
++#define __NR_faccessat2     (__NR_SYSCALL_BASE+439)
+
+diff --git a/arch/arm/kernel/calls.S b/arch/arm/kernel/calls.S
+--- a/arch/arm/kernel/calls.S
++++ b/arch/arm/kernel/calls.S
+@@ -395,5 +395,11 @@
+ /* 386 */   CALL(sys_bpf)
++/* 387-438 */ .rept 52
++              CALL(sys_ni_syscall)
++              .endr
++/* 439 */   CALL(sys_faccessat2)
