@@ -1,0 +1,98 @@
+From: J1 Android 14 Port <j1-port@local>
+Date: Mon, 01 Sep 2026 00:00:00 +0000
+Subject: [PATCH 2/7] pidfd: backport minimal pidfd_open syscall
+
+Android 14 ART/libart and system services require pidfd_open() for
+efficient and race-free process tracking and signal sending.
+Backport minimal stub implementation for kernel 3.10.
+
+Syscall number for ARM: 434
+
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -872,4 +872,5 @@ asmlinkage long sys_getrandom(char __user *buf, size_t count,
+ 			      unsigned int flags);
++asmlinkage long sys_pidfd_open(pid_t pid, unsigned int flags);
+ #endif
+
+diff --git a/kernel/sys.c b/kernel/sys.c
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -41,5 +41,7 @@
+ #include <linux/syscore_ops.h>
+ #include <linux/dmi.h>
+ #include <linux/binfmts.h>
++#include <linux/anon_inodes.h>
++#include <linux/file.h>
+
+ #include <asm/uaccess.h>
+@@ -2200,2 +2202,39 @@ SYSCALL_DEFINE3(getcpu, unsigned __user *, cpu, unsigned __user *, node,
+ }
+ +
++static const struct file_operations pidfd_fops = {
++    .owner      = THIS_MODULE,
++    .llseek     = noop_llseek,
++};
++
++SYSCALL_DEFINE2(pidfd_open,
++        pid_t, pid,
++        unsigned int, flags)
++{
++    struct task_struct *task;
++    struct file *file;
++    int fd;
++
++    if (flags)
++        return -EINVAL;
++
++    if (pid <= 0)
++        return -EINVAL;
++
++    rcu_read_lock();
++    task = find_task_by_vpid(pid);
++    if (task)
++        get_task_struct(task);
++    rcu_read_unlock();
++
++    if (!task)
++        return -ESRCH;
++
++    fd = get_unused_fd_flags(O_CLOEXEC);
++    if (fd < 0) {
++        put_task_struct(task);
++        return fd;
++    }
++
++    file = anon_inode_getfile("[pidfd]", &pidfd_fops, task, O_RDONLY | O_CLOEXEC);
++    if (IS_ERR(file)) {
++        put_unused_fd(fd);
++        put_task_struct(task);
++        return PTR_ERR(file);
++    }
++
++    fd_install(fd, file);
++    return fd;
++}
+
+diff --git a/arch/arm/include/uapi/asm/unistd.h b/arch/arm/include/uapi/asm/unistd.h
+--- a/arch/arm/include/uapi/asm/unistd.h
++++ b/arch/arm/include/uapi/asm/unistd.h
+@@ -411,4 +411,6 @@
+ #define __NR_memfd_create   (__NR_SYSCALL_BASE+385)
++/* 386-423 */
++#define __NR_pidfd_open     (__NR_SYSCALL_BASE+434)
+
+diff --git a/arch/arm/kernel/calls.S b/arch/arm/kernel/calls.S
+--- a/arch/arm/kernel/calls.S
++++ b/arch/arm/kernel/calls.S
+@@ -395,3 +395,52 @@
+ /* 385 */   CALL(sys_memfd_create)
++/* 386-423 */ .rept 38
++        CALL(sys_ni_syscall)
++        .endr
++/* 424-433 stubs */
++        .rept 10
++        CALL(sys_ni_syscall)
++        .endr
++/* 434 */   CALL(sys_pidfd_open)
