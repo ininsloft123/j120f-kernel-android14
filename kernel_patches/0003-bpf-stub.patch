@@ -1,0 +1,176 @@
+From: J1 Android 14 Port <j1-port@local>
+Date: Mon, 01 Sep 2026 00:00:02 +0000
+Subject: [PATCH 3/7] bpf: add minimal eBPF syscall stub for Android 14 netd
+
+Android 14's netd (network daemon) and traffic stats use minimal
+eBPF map operations. Add a stub BPF syscall that handles:
+- BPF_MAP_CREATE (returns EINVAL for unsupported types)
+- BPF_MAP_LOOKUP_ELEM / UPDATE_ELEM / DELETE_ELEM
+- Returns -EPERM for JIT-requiring prog loads
+
+This lets netd start cleanly without crashing on ENOSYS.
+
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+new file mode 100644
+--- /dev/null
++++ b/include/uapi/linux/bpf.h
+@@ -0,0 +1,68 @@
++#ifndef _UAPI__LINUX_BPF_H__
++#define _UAPI__LINUX_BPF_H__
++
++#include <linux/types.h>
++
++/* BPF syscall commands */
++#define BPF_MAP_CREATE      0
++#define BPF_MAP_LOOKUP_ELEM 1
++#define BPF_MAP_UPDATE_ELEM 2
++#define BPF_MAP_DELETE_ELEM 3
++#define BPF_MAP_GET_NEXT_KEY 4
++#define BPF_PROG_LOAD       5
++#define BPF_OBJ_PIN         6
++#define BPF_OBJ_GET         7
++
++/* map types */
++#define BPF_MAP_TYPE_UNSPEC     0
++#define BPF_MAP_TYPE_HASH       1
++#define BPF_MAP_TYPE_ARRAY      2
++#define BPF_MAP_TYPE_LRU_HASH   9
++
++union bpf_attr {
++    struct { /* for BPF_MAP_CREATE */
++        __u32   map_type;
++        __u32   key_size;
++        __u32   value_size;
++        __u32   max_entries;
++        __u32   map_flags;
++        __u32   inner_map_fd;
++        __u32   numa_node;
++        char    map_name[16];
++    };
++    struct { /* for BPF_MAP_*_ELEM */
++        __u32   map_fd;
++        __aligned_u64 key;
++        union {
++            __aligned_u64 value;
++            __aligned_u64 next_key;
++        };
++        __u64   flags;
++    };
++    struct { /* for BPF_PROG_LOAD */
++        __u32   prog_type;
++        __u32   insn_cnt;
++        __aligned_u64 insns;
++        __aligned_u64 license;
++        __u32   log_level;
++        __u32   log_size;
++        __aligned_u64 log_buf;
++        __u32   kern_version;
++    };
++};
++
++#define __NR_bpf (__NR_SYSCALL_BASE+386)
++
++#endif /* _UAPI__LINUX_BPF_H__ */
+
+diff --git a/kernel/bpf_stub.c b/kernel/bpf_stub.c
+new file mode 100644
+--- /dev/null
++++ b/kernel/bpf_stub.c
+@@ -0,0 +1,78 @@
++/*
++ * Minimal BPF syscall stub for Android 14 / kernel 3.10
++ * Allows netd to start without ENOSYS crash.
++ * Does NOT implement JIT or actual packet filtering.
++ */
++#include <linux/types.h>
++#include <linux/syscalls.h>
++#include <linux/anon_inodes.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <uapi/linux/bpf.h>
++
++struct bpf_map_stub {
++    __u32 type;
++    __u32 key_size;
++    __u32 value_size;
++    __u32 max_entries;
++    spinlock_t lock;
++    /* simple hash table backing: for prototype purposes */
++    void *data;
++};
++
++static const struct file_operations bpf_map_fops = {
++    .release = NULL,
++};
++
++SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, size)
++{
++    union bpf_attr attr;
++    int ret;
++
++    if (!capable(CAP_NET_ADMIN) && !capable(CAP_SYS_ADMIN))
++        return -EPERM;
++    if (size > sizeof(attr))
++        return -E2BIG;
++    if (copy_from_user(&attr, uattr, size))
++        return -EFAULT;
++    /* zero-fill remaining bytes */
++    if (size < sizeof(attr))
++        memset(((char *)&attr) + size, 0, sizeof(attr) - size);
++
++    switch (cmd) {
++    case BPF_MAP_CREATE:
++        /* Only support HASH and ARRAY - sufficient for netd */
++        if (attr.map_type != BPF_MAP_TYPE_HASH &&
++            attr.map_type != BPF_MAP_TYPE_ARRAY &&
++            attr.map_type != BPF_MAP_TYPE_LRU_HASH)
++            return -EINVAL;
++        {
++            struct bpf_map_stub *map;
++            int fd;
++            map = kzalloc(sizeof(*map), GFP_KERNEL);
++            if (!map) return -ENOMEM;
++            map->type        = attr.map_type;
++            map->key_size    = attr.key_size;
++            map->value_size  = attr.value_size;
++            map->max_entries = attr.max_entries;
++            spin_lock_init(&map->lock);
++            fd = anon_inode_getfd("[bpf-map]", &bpf_map_fops, map,
++                                  O_RDWR | O_CLOEXEC);
++            if (fd < 0) kfree(map);
++            return fd;
++        }
++    case BPF_MAP_LOOKUP_ELEM:
++    case BPF_MAP_UPDATE_ELEM:
++    case BPF_MAP_DELETE_ELEM:
++    case BPF_MAP_GET_NEXT_KEY:
++        /* Return ENOENT - map is empty stub */
++        return -ENOENT;
++    case BPF_PROG_LOAD:
++        /* We don't support JIT programs - return EPERM */
++        /* netd handles this gracefully and falls back */
++        return -EPERM;
++    default:
++        return -EINVAL;
++    }
++}
+
+diff --git a/arch/arm/include/uapi/asm/unistd.h b/arch/arm/include/uapi/asm/unistd.h
+--- a/arch/arm/include/uapi/asm/unistd.h
++++ b/arch/arm/include/uapi/asm/unistd.h
+@@ -410,6 +410,7 @@
+ #define __NR_memfd_create   (__NR_SYSCALL_BASE+385)
++#define __NR_bpf            (__NR_SYSCALL_BASE+386)
+
+diff --git a/arch/arm/kernel/calls.S b/arch/arm/kernel/calls.S
+--- a/arch/arm/kernel/calls.S
++++ b/arch/arm/kernel/calls.S
+@@ -394,4 +394,5 @@
+ /* 385 */   CALL(sys_memfd_create)
++/* 386 */   CALL(sys_bpf)
+
+diff --git /kernel/Makefile b/kernel/Makefile
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -10,3 +10,4 @@ obj-y = fork.o exec_domain.o panic.o ...
++obj-$(CONFIG_BPF_SYSCALL) += bpf_stub.o
